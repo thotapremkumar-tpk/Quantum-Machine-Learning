@@ -177,7 +177,7 @@ def accuracy(theta, X, Y):
 # In[ ]:
 
 
-epochs = 200           # number of gradient-descent steps per restart
+epochs = 60           # number of gradient-descent steps per restart
 LOSS_ZERO_THRESHOLD = 1e-2 # loss below this (AND 100% accuracy) = "converged
 
 def train_once(seed):
@@ -224,7 +224,7 @@ print("=" * 70)
 best_theta, best_loss_hist, best_acc_hist, best_converged = None, None, None, None
 best_final_loss = np.inf
 
-for seed in range(4):
+for seed in range(2):
     theta, loss_hist, acc_hist, converged_epoch = train_once(seed)
     final_loss = loss_hist[-1]
     conv_str = str(converged_epoch) if converged_epoch else "not reached"
