@@ -19,6 +19,11 @@ n_layers = 2
 # n_layers = 2 means the variational ansatz repeats its rotate-then-entangle
 # block twice. This is a reasonable tradeoff between expressivity and speed.
 
+"""0: ──RY(3.14)──RY(0.00)──RZ(0.00)─╭●───────╭X──RY(3.14)──RY(0.00)──RZ(0.00)─╭●───────╭X─┤  <Z>
+1: ──RY(2.36)──RY(0.00)──RZ(0.00)─╰X─╭●────│───RY(2.36)──RY(0.00)──RZ(0.00)─╰X─╭●────│──┤     
+2: ──RY(0.00)──RY(0.00)──RZ(0.00)────╰X─╭●─│───RY(0.00)──RY(0.00)──RZ(0.00)────╰X─╭●─│──┤     
+3: ──RY(0.00)──RY(0.00)──RZ(0.00)───────╰X─╰●──RY(0.00)──RY(0.00)──RZ(0.00)───────╰X─╰●─┤ 
+"""
 dev = qml.device("default.qubit", wires=n_qubits)
 
 
