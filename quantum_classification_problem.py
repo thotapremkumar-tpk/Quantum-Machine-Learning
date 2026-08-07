@@ -5,6 +5,8 @@ import os
 import pandas as pd
 import pennylane as qml
 from pennylane import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # headless backend — no display window needed
 import matplotlib.pyplot as plt
 
 OUTPUT_DIR = "outputs"
@@ -26,6 +28,10 @@ n_layers = 2
 """
 dev = qml.device("default.qubit", wires=n_qubits)
 
+
+# ---------------------------------------------------------------------------
+# Data loading & preprocessing
+# ---------------------------------------------------------------------------
 
 def load_dataset(path="movielens_sample.xlsx"):
     df = pd.read_excel(path)
@@ -74,10 +80,9 @@ def print_dataset_summary(X_raw, Y_data):
     print(f"Total users: {len(Y_data)}  |  SciFi: {int(np.sum(Y_data == 0))}  |  Romance: {int(np.sum(Y_data == 1))}\n")
 
 
+# ---------------------------------------------------------------------------
 # Quantum Circuit ( Encoding + Trainable + Measurement)
-
-# In[ ]:
-
+# ---------------------------------------------------------------------------
 
 @qml.qnode(dev)
 def circuit(theta, x):
@@ -97,20 +102,14 @@ def circuit(theta, x):
 
     # Measure the expectation value of Pauli-Z on qubit 0. This returns a
     # number in [-1, +1]: -1 means qubit 0 is very likely |1>, +1 means very
-    # likely |0>. We turn this into a class probability in CELL 4.
+    # likely |0>. We turn this into a class probability below.
 
     return qml.expval(qml.PauliZ(0))
 
-_placeholder_theta = np.zeros((n_layers, n_qubits, 2), requires_grad=False)
-print("Circuit structure (qml.draw), illustrated with untrained parameters:")
-print(qml.draw(circuit)(_placeholder_theta, X_data[0]))
-print()
 
-
+# ---------------------------------------------------------------------------
 # Turn the circuit's raw output into a probability, define the loss
-
-# In[ ]:
-
+# ---------------------------------------------------------------------------
 
 def forward(theta, x):
     z = circuit(theta, x)
@@ -134,9 +133,6 @@ def bce_loss(theta, X, Y, pos_weight):
     return total / len(X)
 
 
-# In[ ]:
-
-
 def accuracy(theta, X, Y):
     correct = 0
     for x, y in zip(X, Y):
@@ -145,13 +141,13 @@ def accuracy(theta, X, Y):
     return correct / len(X)
 
 
+# ---------------------------------------------------------------------------
 # Training loop (single restart) + multi-restart driver
+# ---------------------------------------------------------------------------
 
-# In[ ]:
+epochs = 60            # number of gradient-descent steps per restart
+LOSS_ZERO_THRESHOLD = 1e-2  # loss below this (AND 100% accuracy) = "converged"
 
-
-epochs = 60           # number of gradient-descent steps per restart
-LOSS_ZERO_THRESHOLD = 1e-2 # loss below this (AND 100% accuracy) = "converged
 
 def train_once(seed, X_data, Y_data, pos_weight, epochs=60):
     rng = np.random.default_rng(seed)
@@ -180,36 +176,45 @@ def train_once(seed, X_data, Y_data, pos_weight, epochs=60):
     return theta, loss_history, acc_history, converged_epoch
 
 
-# In[ ]:
+# ---------------------------------------------------------------------------
+# Modular helpers called by main()
+# ---------------------------------------------------------------------------
 
-
-def main():
-    X_raw, Y_data = load_dataset()
-    print_dataset_summary(X_raw, Y_data)
-    X_data = angle_encode(X_raw)
-
+def setup_class_weights(Y_data):
+    """Compute pos_weight to handle class imbalance between SciFi and Romance."""
     n_scifi = int(np.sum(Y_data == 0))
     n_romance = int(np.sum(Y_data == 1))
     pos_weight = n_scifi / n_romance if n_romance > 0 else 1.0
     print(f"Using pos_weight = {pos_weight:.4f} for Romance examples")
+    return pos_weight
 
+
+def draw_circuit(X_data):
+    """Print a human-readable diagram of the untrained circuit."""
     placeholder_theta = np.zeros((n_layers, n_qubits, 2), requires_grad=False)
     print("Circuit structure (qml.draw), illustrated with untrained parameters:")
     print(qml.draw(circuit)(placeholder_theta, X_data[0]))
     print()
 
+
+def run_multi_restart_training(X_data, Y_data, pos_weight, n_restarts=2):
+    """Run training from multiple random seeds; return the best result."""
     print(" Parametric quantum circuit for Movie Preference (SciFi vs Romance)")
     print("=" * 70)
 
     best_theta, best_loss_hist, best_acc_hist, best_converged = None, None, None, None
     best_final_loss = np.inf
 
-    for seed in range(2):
-        theta, loss_hist, acc_hist, converged_epoch = train_once(seed, X_data, Y_data, pos_weight)
+    for seed in range(n_restarts):
+        theta, loss_hist, acc_hist, converged_epoch = train_once(
+            seed, X_data, Y_data, pos_weight
+        )
         final_loss = loss_hist[-1]
         conv_str = str(converged_epoch) if converged_epoch else "not reached"
-        print(f"restart {seed} | final loss = {final_loss:.4f} | "
-              f"100% accuracy + near-zero loss first reached at epoch: {conv_str}")
+        print(
+            f"restart {seed} | final loss = {final_loss:.4f} | "
+            f"100% accuracy + near-zero loss first reached at epoch: {conv_str}"
+        )
         if final_loss < best_final_loss:
             best_final_loss = final_loss
             best_theta = theta
@@ -217,13 +222,17 @@ def main():
             best_acc_hist = acc_hist
             best_converged = converged_epoch
 
-    theta = best_theta
     print(f"\nBest restart final loss: {best_final_loss:.4f}")
     if best_converged:
         print(f"Best restart reached 100% accuracy and near-zero loss at epoch {best_converged}.")
     else:
         print("Best restart did not reach the zero-loss threshold within the epoch budget.")
 
+    return best_theta, best_loss_hist, best_acc_hist, best_converged
+
+
+def print_final_predictions(theta, X_data, Y_data):
+    """Print a formatted table of per-user predictions vs ground-truth labels."""
     print("\nFinal predictions:")
     print("-" * 70)
     print(f"{'UserID':>6} | {'target':>8} | {'p(Romance)':>11} | {'predicted':>9}")
@@ -239,40 +248,70 @@ def main():
     print("-" * 70)
     print(f"Accuracy: {correct}/{len(Y_data)}")
 
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    epochs_range = range(1, len(best_loss_hist) + 1)
 
-    ax1.plot(epochs_range, best_loss_hist, color="#d62728", linewidth=2, label="BCE loss")
+def plot_training_curves(loss_hist, acc_hist, converged_epoch):
+    """Plot BCE loss and accuracy vs epoch and save the figure."""
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    epochs_range = range(1, len(loss_hist) + 1)
+
+    ax1.plot(epochs_range, loss_hist, color="#d62728", linewidth=2, label="BCE loss")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Binary cross-entropy loss", color="#d62728")
     ax1.tick_params(axis="y", labelcolor="#d62728")
     ax1.set_yscale("log")
 
     ax2 = ax1.twinx()
-    ax2.plot(epochs_range, best_acc_hist, color="#1f77b4", linewidth=2, linestyle="--", label="Accuracy")
+    ax2.plot(epochs_range, acc_hist, color="#1f77b4", linewidth=2, linestyle="--", label="Accuracy")
     ax2.set_ylabel("Accuracy", color="#1f77b4")
     ax2.tick_params(axis="y", labelcolor="#1f77b4")
     ax2.set_ylim(-0.05, 1.05)
 
-    if best_converged:
-        ax1.axvline(best_converged, color="gray", linestyle=":", linewidth=1.5)
-        ax1.text(best_converged + 1, best_loss_hist[0] * 0.5,
-                 f"converged @ epoch {best_converged}", fontsize=9, color="gray")
+    if converged_epoch:
+        ax1.axvline(converged_epoch, color="gray", linestyle=":", linewidth=1.5)
+        ax1.text(
+            converged_epoch + 1,
+            loss_hist[0] * 0.5,
+            f"converged @ epoch {converged_epoch}",
+            fontsize=9,
+            color="gray",
+        )
 
     plt.title("Movie Preference VQC training: loss and accuracy vs epoch (best restart)")
     fig.tight_layout()
     plt.savefig(f"{OUTPUT_DIR}/loss_curve.png", dpi=150)
-    plt.show()
+    plt.close(fig)
+    print(f"\nSaved loss curve to {OUTPUT_DIR}/loss_curve.png")
 
+
+def save_circuit_diagram(theta, X_data):
+    """Render and save the trained circuit diagram for the first user."""
     fig2, ax = qml.draw_mpl(circuit, decimals=2, style="pennylane")(theta, X_data[0])
     fig2.suptitle("Trained Movie Preference variational circuit (shown for User 0)")
     fig2.savefig(f"{OUTPUT_DIR}/circuit_diagram.png", dpi=150, bbox_inches="tight")
-    plt.show()
-
-    print(f"\nSaved loss curve to {OUTPUT_DIR}/loss_curve.png")
+    plt.close(fig2)
     print(f"Saved circuit diagram to {OUTPUT_DIR}/circuit_diagram.png")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    X_raw, Y_data = load_dataset()
+    # print_dataset_summary(X_raw, Y_data)  # commented out to avoid bloating stdout
+    X_data = angle_encode(X_raw)
+
+    pos_weight = setup_class_weights(Y_data)
+    draw_circuit(X_data)
+
+    best_theta, best_loss_hist, best_acc_hist, best_converged = run_multi_restart_training(
+        X_data, Y_data, pos_weight
+    )
+
+    print_final_predictions(best_theta, X_data, Y_data)
+    plot_training_curves(best_loss_hist, best_acc_hist, best_converged)
+    save_circuit_diagram(best_theta, X_data)
 
 
 if __name__ == "__main__":
     main()
-
