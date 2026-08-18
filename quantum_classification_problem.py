@@ -33,8 +33,8 @@ dev = qml.device("default.qubit", wires=n_qubits)
 # Data loading & preprocessing
 # ---------------------------------------------------------------------------
 
-def load_dataset(path="movielens_sample.xlsx"):
-    df = pd.read_excel(path)
+def load_dataset(path="movielens_sample.csv"):
+    df = pd.read_csv(path)
     required_columns = [
         "Movie 1 (Sci-Fi)",
         "Movie 2 (Sci-Fi)",
