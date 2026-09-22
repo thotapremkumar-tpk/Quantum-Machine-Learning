@@ -9,7 +9,7 @@ import matplotlib
 matplotlib.use('Agg')  # headless backend — no display window needed
 import matplotlib.pyplot as plt
 
-OUTPUT_DIR = "outputs"
+OUTPUT_DIR = "outputs/quantum"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 np.random.seed(42)
@@ -17,15 +17,11 @@ np.random.seed(42)
 n_qubits = 4
 # n_qubits = 4 because there are four movie rating features.
 
-n_layers = 2
-# n_layers = 2 means the variational ansatz repeats its rotate-then-entangle
-# block twice. This is a reasonable tradeoff between expressivity and speed.
+n_layers = 3
+# n_layers = 3 means the variational ansatz repeats its rotate-then-entangle
+# block three times, up from 2, for more expressivity. Use draw_circuit() /
+# qml.draw() at runtime for an up-to-date diagram — it depends on n_layers.
 
-"""0: ──RY(3.14)──RY(0.00)──RZ(0.00)─╭●───────╭X──RY(3.14)──RY(0.00)──RZ(0.00)─╭●───────╭X─┤  <Z>
-1: ──RY(2.36)──RY(0.00)──RZ(0.00)─╰X─╭●────│───RY(2.36)──RY(0.00)──RZ(0.00)─╰X─╭●────│──┤     
-2: ──RY(0.00)──RY(0.00)──RZ(0.00)────╰X─╭●─│───RY(0.00)──RY(0.00)──RZ(0.00)────╰X─╭●─│──┤     
-3: ──RY(0.00)──RY(0.00)──RZ(0.00)───────╰X─╰●──RY(0.00)──RY(0.00)──RZ(0.00)───────╰X─╰●─┤ 
-"""
 dev = qml.device("default.qubit", wires=n_qubits)
 
 
@@ -92,32 +88,39 @@ def circuit(theta, x):
             qml.RY(x[i], wires=i)
 
         # --- 2) Trainable rotations (the "learned weights") ---
+        # RX+RY+RZ gives each qubit a full single-qubit rotation (3 Euler
+        # angles) instead of the previous RY+RZ-only (2 angles), so the
+        # circuit can reach a strictly larger set of states per layer.
         for i in range(n_qubits):
-            qml.RY(theta[l, i, 0], wires=i)
-            qml.RZ(theta[l, i, 1], wires=i)
+            qml.RX(theta[l, i, 0], wires=i)
+            qml.RY(theta[l, i, 1], wires=i)
+            qml.RZ(theta[l, i, 2], wires=i)
 
         # --- 3) Entangle all 4 qubits in a ring ---
         for i in range(n_qubits):
             qml.CNOT(wires=[i, (i + 1) % n_qubits])
 
-    # Measure the expectation value of Pauli-Z on qubit 0. This returns a
-    # number in [-1, +1]: -1 means qubit 0 is very likely |1>, +1 means very
-    # likely |0>. We turn this into a class probability below.
-
-    return qml.expval(qml.PauliZ(0))
+    # Measure the expectation value of Pauli-Z on every qubit (not just
+    # qubit 0), so information entangled into qubits 1-3 isn't discarded.
+    return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
 
 
 # ---------------------------------------------------------------------------
 # Turn the circuit's raw output into a probability, define the loss
 # ---------------------------------------------------------------------------
 
-def forward(theta, x):
-    z = circuit(theta, x)
-    p = (1.0 - z) / 2.0
+def forward(theta, out_weights, x):
+    # Combine all n_qubits Pauli-Z expectation values with a trainable
+    # linear layer (weights + bias), then squash to a probability with a
+    # sigmoid. This lets training decide how much each qubit matters,
+    # instead of hard-coding "only qubit 0 counts".
+    z = np.stack(circuit(theta, x))
+    logit = np.dot(z, out_weights[:-1]) + out_weights[-1]
+    p = 1.0 / (1.0 + np.exp(-logit))
     return np.clip(p, 1e-9, 1 - 1e-9)
 
 
-def bce_loss(theta, X, Y, pos_weight):
+def bce_loss(theta, out_weights, X, Y, pos_weight):
     """Binary cross-entropy loss.
 
     BCE converts the raw circuit output into a probability and compares it
@@ -127,16 +130,16 @@ def bce_loss(theta, X, Y, pos_weight):
     """
     total = 0.0
     for x, y in zip(X, Y):
-        p = forward(theta, x)
+        p = forward(theta, out_weights, x)
         w = float(pos_weight) if y == 1 else 1.0
         total += -w * (y * np.log(p) + (1 - y) * np.log(1 - p))
     return total / len(X)
 
 
-def accuracy(theta, X, Y):
+def accuracy(theta, out_weights, X, Y):
     correct = 0
     for x, y in zip(X, Y):
-        pred = 1 if forward(theta, x) > 0.5 else 0
+        pred = 1 if forward(theta, out_weights, x) > 0.5 else 0
         correct += int(pred == y)
     return correct / len(X)
 
@@ -145,18 +148,21 @@ def accuracy(theta, X, Y):
 # Training loop (single restart) + multi-restart driver
 # ---------------------------------------------------------------------------
 
-epochs = 60            # number of gradient-descent steps per restart
+epochs = 200            # number of gradient-descent steps per restart
 LOSS_ZERO_THRESHOLD = 1e-2  # loss below this (AND 100% accuracy) = "converged"
 
 
-def train_once(seed, X_data, Y_data, pos_weight, epochs=60):
+def train_once(seed, X_data, Y_data, pos_weight, epochs=200):
     rng = np.random.default_rng(seed)
 
     # Initialize parameters as small random values (0.8 * standard normal)
     # rather than zeros, since all-zero rotations would start the circuit in
     # a symmetric state with vanishing/uninformative gradients.
 
-    theta = np.array(0.8 * rng.standard_normal((n_layers, n_qubits, 2)), requires_grad=True)
+    theta = np.array(0.8 * rng.standard_normal((n_layers, n_qubits, 3)), requires_grad=True)
+    # Output layer: combines the n_qubits Pauli-Z expectation values into a
+    # single logit (n_qubits weights + 1 bias).
+    out_weights = np.array(0.1 * rng.standard_normal(n_qubits + 1), requires_grad=True)
 
     # Adam optimizer: adapts the learning rate per-parameter, generally
     # converges faster and more reliably than plain gradient descent here.
@@ -166,14 +172,16 @@ def train_once(seed, X_data, Y_data, pos_weight, epochs=60):
     acc_history = []
     converged_epoch = None
     for epoch in range(1, epochs + 1):
-        theta = opt.step(lambda t: bce_loss(t, X_data, Y_data, pos_weight), theta)
-        loss = bce_loss(theta, X_data, Y_data, pos_weight)
-        acc = accuracy(theta, X_data, Y_data)
+        theta, out_weights = opt.step(
+            lambda t, w: bce_loss(t, w, X_data, Y_data, pos_weight), theta, out_weights
+        )
+        loss = bce_loss(theta, out_weights, X_data, Y_data, pos_weight)
+        acc = accuracy(theta, out_weights, X_data, Y_data)
         loss_history.append(float(loss))
         acc_history.append(acc)
         if converged_epoch is None and loss < LOSS_ZERO_THRESHOLD and acc == 1.0:
             converged_epoch = epoch
-    return theta, loss_history, acc_history, converged_epoch
+    return theta, out_weights, loss_history, acc_history, converged_epoch
 
 
 # ---------------------------------------------------------------------------
@@ -191,22 +199,23 @@ def setup_class_weights(Y_data):
 
 def draw_circuit(X_data):
     """Print a human-readable diagram of the untrained circuit."""
-    placeholder_theta = np.zeros((n_layers, n_qubits, 2), requires_grad=False)
+    placeholder_theta = np.zeros((n_layers, n_qubits, 3), requires_grad=False)
     print("Circuit structure (qml.draw), illustrated with untrained parameters:")
     print(qml.draw(circuit)(placeholder_theta, X_data[0]))
     print()
 
 
-def run_multi_restart_training(X_data, Y_data, pos_weight, n_restarts=2):
+def run_multi_restart_training(X_data, Y_data, pos_weight, n_restarts=4):
     """Run training from multiple random seeds; return the best result."""
     print(" Parametric quantum circuit for Movie Preference (SciFi vs Romance)")
     print("=" * 70)
 
-    best_theta, best_loss_hist, best_acc_hist, best_converged = None, None, None, None
+    best_theta, best_out_weights = None, None
+    best_loss_hist, best_acc_hist, best_converged = None, None, None
     best_final_loss = np.inf
 
     for seed in range(n_restarts):
-        theta, loss_hist, acc_hist, converged_epoch = train_once(
+        theta, out_weights, loss_hist, acc_hist, converged_epoch = train_once(
             seed, X_data, Y_data, pos_weight
         )
         final_loss = loss_hist[-1]
@@ -218,6 +227,7 @@ def run_multi_restart_training(X_data, Y_data, pos_weight, n_restarts=2):
         if final_loss < best_final_loss:
             best_final_loss = final_loss
             best_theta = theta
+            best_out_weights = out_weights
             best_loss_hist = loss_hist
             best_acc_hist = acc_hist
             best_converged = converged_epoch
@@ -228,10 +238,10 @@ def run_multi_restart_training(X_data, Y_data, pos_weight, n_restarts=2):
     else:
         print("Best restart did not reach the zero-loss threshold within the epoch budget.")
 
-    return best_theta, best_loss_hist, best_acc_hist, best_converged
+    return best_theta, best_out_weights, best_loss_hist, best_acc_hist, best_converged
 
 
-def print_final_predictions(theta, X_data, Y_data):
+def print_final_predictions(theta, out_weights, X_data, Y_data):
     """Print a formatted table of per-user predictions vs ground-truth labels."""
     print("\nFinal predictions:")
     print("-" * 70)
@@ -239,7 +249,7 @@ def print_final_predictions(theta, X_data, Y_data):
     print("-" * 70)
     correct = 0
     for i, (x, y) in enumerate(zip(X_data, Y_data)):
-        p = forward(theta, x)
+        p = forward(theta, out_weights, x)
         pred = 1 if p > 0.5 else 0
         correct += int(pred == y)
         true_name = "Romance" if y == 1 else "SciFi"
@@ -304,11 +314,11 @@ def main():
     pos_weight = setup_class_weights(Y_data)
     draw_circuit(X_data)
 
-    best_theta, best_loss_hist, best_acc_hist, best_converged = run_multi_restart_training(
-        X_data, Y_data, pos_weight
+    best_theta, best_out_weights, best_loss_hist, best_acc_hist, best_converged = (
+        run_multi_restart_training(X_data, Y_data, pos_weight)
     )
 
-    print_final_predictions(best_theta, X_data, Y_data)
+    print_final_predictions(best_theta, best_out_weights, X_data, Y_data)
     plot_training_curves(best_loss_hist, best_acc_hist, best_converged)
     save_circuit_diagram(best_theta, X_data)
 
